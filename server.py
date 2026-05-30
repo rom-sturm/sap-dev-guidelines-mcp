@@ -204,16 +204,10 @@ def _remove_document_sync(name: str, index: dict):
 
 # ─── Hybrid search ─────────────────────────────────────────────────────────────
 
-def keyword_score(text: str, query: str) -> float:
-    tokens = re.findall(r'\w+', query.lower())
-    if not tokens:
-        return 0.0
-    t = text.lower()
-    return sum(t.count(tok) for tok in tokens) / len(tokens)
-
 def hybrid_search(query: str, n_results: int = 5, doc_filter: Optional[str] = None) -> list[dict]:
-    """Qdrant vector search + keyword re-ranking. Blocking; call via to_thread."""
+    """Qdrant vector search + BM25 re-ranking. Blocking; call via to_thread."""
     from qdrant_client.models import Filter, FieldCondition, MatchValue
+    from rank_bm25 import BM25Okapi
 
     client = _get_client()
     total  = client.count(collection_name=COLLECTION).count
@@ -236,15 +230,25 @@ def hybrid_search(query: str, n_results: int = 5, doc_filter: Optional[str] = No
         query_filter=qfilter,
     )
 
+    if not results:
+        return []
+
+    # BM25 over the semantic candidates only (fast — small corpus slice)
+    texts      = [r.payload["text"] for r in results]
+    tokenized  = [re.findall(r'\w+', t.lower()) for t in texts]
+    bm25       = BM25Okapi(tokenized)
+    qtokens    = re.findall(r'\w+', query.lower())
+    bm25_raw   = bm25.get_scores(qtokens)
+    max_bm25   = float(max(bm25_raw)) if max(bm25_raw) > 0 else 1.0
+
     combined = []
-    for r in results:
-        text      = r.payload["text"]
-        sem_score = float(r.score)   # Qdrant cosine score: 1.0 = identical
-        kw_score  = keyword_score(text, query)
-        final     = 0.70 * sem_score + 0.30 * min(kw_score / 5.0, 1.0)
+    for i, r in enumerate(results):
+        sem_score = float(r.score)                # Qdrant cosine: 1.0 = identical
+        kw_score  = bm25_raw[i] / max_bm25        # normalised to [0, 1]
+        final     = 0.70 * sem_score + 0.30 * kw_score
         combined.append({
             "id":        str(r.id),
-            "text":      text,
+            "text":      texts[i],
             "doc_name":  r.payload["doc_name"],
             "chunk_idx": r.payload["chunk_idx"],
             "sem_score": round(sem_score, 3),
@@ -712,10 +716,13 @@ async def call_tool(name: str, arguments: dict):
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
+def _warmup():
+    _get_model()   # loads SentenceTransformer weights (~80 MB) into RAM
+    _get_client()  # opens Qdrant store and creates collection if absent
+
 async def main():
-    # Pre-warm: load the embedding model and open the Qdrant store before
-    # accepting any MCP requests so the first tool call has no cold-start delay.
-    await asyncio.to_thread(_get_client)
+    # Load model + open DB before accepting requests — eliminates cold-start.
+    await asyncio.to_thread(_warmup)
     async with stdio_server() as (r, w):
         await app.run(r, w, app.create_initialization_options())
 

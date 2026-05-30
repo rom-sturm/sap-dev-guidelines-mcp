@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-SAP Developer Guidelines MCP Server — ChromaDB Edition
+SAP Developer Guidelines MCP Server — Qdrant Edition
 - Local sentence-transformers embeddings (fully offline)
-- Hybrid search: semantic (ChromaDB) + keyword (BM25-style)
+- Qdrant embedded vector store (persistent HNSW, no Docker required)
+- Hybrid search: semantic (Qdrant) + keyword (TF-style)
 - Auto-chunking with overlap
 - Re-index detection via MD5 checksum
 - RAG-augmented ABAP / SAP HANA SQL snippet generation
+- All heavy ops run in thread pool — event loop never blocked
 """
 
 import json
-import os
+import uuid
 import re
 import hashlib
 import shutil
@@ -34,58 +36,66 @@ except ImportError:
         PDF_BACKEND = None
 
 # ─── Lazy-loaded heavy deps ────────────────────────────────────────────────────
-_chroma_client = None
-_collection    = None
-_embed_fn      = None
+_qdrant_client = None
+_embed_model   = None
 
-def _get_embedding_fn():
-    global _embed_fn
-    if _embed_fn is None:
-        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-        _embed_fn = SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"   # ~80 MB, fast, good quality
-        )
-    return _embed_fn
+COLLECTION = "sap_guidelines"
+VECTOR_DIM  = 384   # all-MiniLM-L6-v2 output dimension
 
-def _get_collection():
-    global _chroma_client, _collection
-    if _collection is None:
-        import chromadb
-        _chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        _collection = _chroma_client.get_or_create_collection(
-            name="sap_guidelines",
-            embedding_function=_get_embedding_fn(),
-            metadata={"hnsw:space": "cosine"},
-        )
-    return _collection
+def _get_model():
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embed_model
+
+def _get_client():
+    global _qdrant_client
+    if _qdrant_client is None:
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import Distance, VectorParams
+        _qdrant_client = QdrantClient(path=str(QDRANT_DIR))
+        existing = [c.name for c in _qdrant_client.get_collections().collections]
+        if COLLECTION not in existing:
+            _qdrant_client.create_collection(
+                collection_name=COLLECTION,
+                vectors_config=VectorParams(size=VECTOR_DIM, distance=Distance.COSINE),
+            )
+    return _qdrant_client
+
+def _embed(texts: list[str]) -> list[list[float]]:
+    return _get_model().encode(texts, show_progress_bar=False).tolist()
+
+def _chunk_uuid(chunk_str_id: str) -> str:
+    """Deterministic UUID5 from a string chunk ID so re-indexing upserts in-place."""
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, chunk_str_id))
 
 # ─── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR  = Path(__file__).parent
-DOCS_DIR  = BASE_DIR / "documents"
-CHROMA_DIR = BASE_DIR / "chroma_store"
+BASE_DIR   = Path(__file__).parent
+DOCS_DIR   = BASE_DIR / "documents"
+QDRANT_DIR = BASE_DIR / "qdrant_store"
 INDEX_FILE = BASE_DIR / "doc_index.json"
-for d in [DOCS_DIR, CHROMA_DIR]:
+for d in [DOCS_DIR, QDRANT_DIR]:
     d.mkdir(exist_ok=True)
 
 # ─── Chunking ──────────────────────────────────────────────────────────────────
-CHUNK_SIZE    = 500    # characters per chunk
-CHUNK_OVERLAP = 100   # overlap between consecutive chunks
+CHUNK_SIZE    = 1000   # characters per chunk (larger = more context per result)
+CHUNK_OVERLAP = 200    # overlap to avoid splitting concepts at boundaries
 
 def chunk_text(text: str, doc_name: str) -> list[dict]:
-    """Split text into overlapping chunks with metadata."""
     text = re.sub(r'\s+', ' ', text).strip()
     chunks = []
     step = CHUNK_SIZE - CHUNK_OVERLAP
     for i, start in enumerate(range(0, len(text), step)):
         end = start + CHUNK_SIZE
         chunk = text[start:end].strip()
-        if len(chunk) < 80:          # skip tiny tail chunks
+        if len(chunk) < 80:
             continue
         chunks.append({
-            "id":       f"{doc_name}__chunk_{i}",
-            "text":     chunk,
-            "doc_name": doc_name,
-            "chunk_idx": i,
+            "id":         f"{doc_name}__chunk_{i}",
+            "text":       chunk,
+            "doc_name":   doc_name,
+            "chunk_idx":  i,
             "start_char": start,
         })
         if end >= len(text):
@@ -119,32 +129,49 @@ def extract_text(path: Path) -> str:
             return "\n\n".join(p.extract_text() or "" for p in pdf.pages)
     return "[PDF extraction unavailable — install: pip install pymupdf]"
 
+def _delete_doc_chunks(doc_name: str):
+    """Remove all Qdrant points that belong to doc_name."""
+    from qdrant_client.models import Filter, FieldCondition, MatchValue, FilterSelector
+    client = _get_client()
+    client.delete(
+        collection_name=COLLECTION,
+        points_selector=FilterSelector(
+            filter=Filter(must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_name))])
+        ),
+    )
+
 def index_document(dest: Path, description: str, index: dict) -> dict:
-    """Extract text, chunk, embed and upsert into ChromaDB."""
+    """Extract → chunk → embed → upsert into Qdrant. Blocking; call via to_thread."""
+    from qdrant_client.models import PointStruct
+
     text = extract_text(dest)
     cache = DOCS_DIR / (dest.stem + ".cache.txt")
     cache.write_text(text, encoding="utf-8")
     checksum = file_checksum(dest)
 
     chunks = chunk_text(text, dest.name)
-    col = _get_collection()
 
-    # Remove old chunks for this document (re-index case)
-    existing = col.get(where={"doc_name": dest.name})
-    if existing["ids"]:
-        col.delete(ids=existing["ids"])
+    _delete_doc_chunks(dest.name)
 
-    # Upsert new chunks in batches
+    client = _get_client()
     BATCH = 64
     for b in range(0, len(chunks), BATCH):
-        batch = chunks[b:b+BATCH]
-        col.upsert(
-            ids       = [c["id"] for c in batch],
-            documents = [c["text"] for c in batch],
-            metadatas = [{"doc_name": c["doc_name"],
-                          "chunk_idx": c["chunk_idx"],
-                          "start_char": c["start_char"]} for c in batch],
-        )
+        batch   = chunks[b : b + BATCH]
+        vectors = _embed([c["text"] for c in batch])
+        points  = [
+            PointStruct(
+                id=_chunk_uuid(c["id"]),
+                vector=vec,
+                payload={
+                    "doc_name":   c["doc_name"],
+                    "chunk_idx":  c["chunk_idx"],
+                    "start_char": c["start_char"],
+                    "text":       c["text"],
+                },
+            )
+            for c, vec in zip(batch, vectors)
+        ]
+        client.upsert(collection_name=COLLECTION, points=points)
 
     entry = {
         "description": description,
@@ -159,18 +186,25 @@ def index_document(dest: Path, description: str, index: dict) -> dict:
     return entry
 
 def check_stale_documents(index: dict) -> list[str]:
-    """Return list of doc names whose file checksum has changed."""
     stale = []
     for name, meta in index.items():
         path = DOCS_DIR / name
-        if path.exists() and file_checksum(path) != meta.get("checksum",""):
+        if path.exists() and file_checksum(path) != meta.get("checksum", ""):
             stale.append(name)
     return stale
+
+def _remove_document_sync(name: str, index: dict):
+    """Blocking removal from Qdrant + cache + index file. Call via to_thread."""
+    _delete_doc_chunks(name)
+    cache = Path(index[name].get("cache", ""))
+    if cache.exists():
+        cache.unlink()
+    del index[name]
+    save_index(index)
 
 # ─── Hybrid search ─────────────────────────────────────────────────────────────
 
 def keyword_score(text: str, query: str) -> float:
-    """Simple TF-style keyword overlap score."""
     tokens = re.findall(r'\w+', query.lower())
     if not tokens:
         return 0.0
@@ -178,34 +212,44 @@ def keyword_score(text: str, query: str) -> float:
     return sum(t.count(tok) for tok in tokens) / len(tokens)
 
 def hybrid_search(query: str, n_results: int = 5, doc_filter: Optional[str] = None) -> list[dict]:
-    """Combine ChromaDB semantic search with keyword scoring."""
-    col = _get_collection()
-    where = {"doc_name": doc_filter} if doc_filter else None
+    """Qdrant vector search + keyword re-ranking. Blocking; call via to_thread."""
+    from qdrant_client.models import Filter, FieldCondition, MatchValue
 
-    # Semantic results (ask for 3× to rerank)
-    semantic_n = min(n_results * 3, col.count() or 1)
-    kwargs = dict(query_texts=[query], n_results=semantic_n)
-    if where:
-        kwargs["where"] = where
-    res = col.query(**kwargs)
+    client = _get_client()
+    total  = client.count(collection_name=COLLECTION).count
+    if total == 0:
+        return []
+
+    qvec       = _embed([query])[0]
+    semantic_n = min(n_results * 3, total)
+
+    qfilter = (
+        Filter(must=[FieldCondition(key="doc_name", match=MatchValue(value=doc_filter))])
+        if doc_filter else None
+    )
+
+    results = client.search(
+        collection_name=COLLECTION,
+        query_vector=qvec,
+        limit=semantic_n,
+        with_payload=True,
+        query_filter=qfilter,
+    )
 
     combined = []
-    for i, (doc_id, text, meta, dist) in enumerate(zip(
-        res["ids"][0], res["documents"][0],
-        res["metadatas"][0], res["distances"][0]
-    )):
-        sem_score  = 1.0 - float(dist)          # cosine → similarity
-        kw_score   = keyword_score(text, query)
-        # Weighted blend: 70% semantic, 30% keyword
-        final_score = 0.70 * sem_score + 0.30 * min(kw_score / 5.0, 1.0)
+    for r in results:
+        text      = r.payload["text"]
+        sem_score = float(r.score)   # Qdrant cosine score: 1.0 = identical
+        kw_score  = keyword_score(text, query)
+        final     = 0.70 * sem_score + 0.30 * min(kw_score / 5.0, 1.0)
         combined.append({
-            "id":         doc_id,
-            "text":       text,
-            "doc_name":   meta["doc_name"],
-            "chunk_idx":  meta["chunk_idx"],
-            "sem_score":  round(sem_score, 3),
-            "kw_score":   round(kw_score, 3),
-            "score":      round(final_score, 3),
+            "id":        str(r.id),
+            "text":      text,
+            "doc_name":  r.payload["doc_name"],
+            "chunk_idx": r.payload["chunk_idx"],
+            "sem_score": round(sem_score, 3),
+            "kw_score":  round(kw_score, 3),
+            "score":     round(final, 3),
         })
 
     combined.sort(key=lambda x: x["score"], reverse=True)
@@ -214,17 +258,15 @@ def hybrid_search(query: str, n_results: int = 5, doc_filter: Optional[str] = No
 # ─── RAG context builder ───────────────────────────────────────────────────────
 
 def build_rag_context(query: str, n: int = 4) -> str:
-    """Retrieve top-n chunks and format as context block."""
+    """Blocking; always call via to_thread or from within a thread."""
     try:
         hits = hybrid_search(query, n_results=n)
         if not hits:
             return ""
-        parts = []
-        for h in hits:
-            parts.append(
-                f"[{h['doc_name']} | chunk {h['chunk_idx']} | score {h['score']}]\n"
-                f"{h['text']}"
-            )
+        parts = [
+            f"[{h['doc_name']} | chunk {h['chunk_idx']} | score {h['score']}]\n{h['text']}"
+            for h in hits
+        ]
         return "\n\n---\n\n".join(parts)
     except Exception:
         return ""
@@ -521,13 +563,12 @@ async def call_tool(name: str, arguments: dict):
             shutil.copy2(fp, dest)
 
         index = load_index()
-        # Detect if already indexed and unchanged
         if dest.name in index and index[dest.name].get("checksum") == file_checksum(dest):
             return [TextContent(type="text", text=
                 f"Already up-to-date: {dest.name} ({index[dest.name]['chunks']} chunks). "
                 f"No re-indexing needed.")]
 
-        entry = index_document(dest, desc, index)
+        entry = await asyncio.to_thread(index_document, dest, desc, index)
         return [TextContent(type="text", text=
             f"Indexed: {dest.name}\n"
             f"  Characters : {entry['chars']:,}\n"
@@ -555,20 +596,11 @@ async def call_tool(name: str, arguments: dict):
 
     # ── remove_document ────────────────────────────────────────────────────────
     elif name == "remove_document":
-        n = arguments["name"]
+        n     = arguments["name"]
         index = load_index()
         if n not in index:
             return [TextContent(type="text", text=f"Not found: {n}")]
-        # Remove from ChromaDB
-        col = _get_collection()
-        existing = col.get(where={"doc_name": n})
-        if existing["ids"]:
-            col.delete(ids=existing["ids"])
-        # Remove cache
-        cache = Path(index[n].get("cache",""))
-        if cache.exists(): cache.unlink()
-        del index[n]
-        save_index(index)
+        await asyncio.to_thread(_remove_document_sync, n, index)
         return [TextContent(type="text", text=f"Removed: {n}")]
 
     # ── reindex_all ────────────────────────────────────────────────────────────
@@ -579,9 +611,9 @@ async def call_tool(name: str, arguments: dict):
             return [TextContent(type="text", text="All documents are up-to-date. Nothing to reindex.")]
         results = []
         for n in stale:
-            path = DOCS_DIR / n
-            desc = index[n].get("description","")
-            entry = index_document(path, desc, index)
+            path  = DOCS_DIR / n
+            desc  = index[n].get("description", "")
+            entry = await asyncio.to_thread(index_document, path, desc, index)
             results.append(f"  Re-indexed: {n} → {entry['chunks']} chunks")
         return [TextContent(type="text", text=f"Reindexed {len(stale)} document(s):\n" + "\n".join(results))]
 
@@ -591,9 +623,9 @@ async def call_tool(name: str, arguments: dict):
         max_r      = int(arguments.get("max_results", 5))
         doc_filter = arguments.get("doc_filter")
         try:
-            hits = hybrid_search(q, n_results=max_r, doc_filter=doc_filter)
+            hits = await asyncio.to_thread(hybrid_search, q, max_r, doc_filter)
         except Exception as e:
-            return [TextContent(type="text", text=f"Search error: {e}\nMake sure ChromaDB is installed and documents are indexed.")]
+            return [TextContent(type="text", text=f"Search error: {e}\nMake sure documents are indexed.")]
         if not hits:
             return [TextContent(type="text", text=f"No results for: {q}")]
         parts = [f"Hybrid search results for '{q}' ({len(hits)} hits):\n"]
@@ -613,20 +645,18 @@ async def call_tool(name: str, arguments: dict):
         index  = load_index()
         if n not in index:
             return [TextContent(type="text", text=f"Not found: {n}")]
-        cp = Path(index[n].get("cache",""))
+        cp   = Path(index[n].get("cache", ""))
         text = cp.read_text(encoding="utf-8") if cp.exists() else "(no cache)"
         return [TextContent(type="text", text=
             f"{n} [chars {start}–{start+length}]:\n\n{text[start:start+length]}")]
 
     # ── abap_snippet ───────────────────────────────────────────────────────────
     elif name == "abap_snippet":
-        stype = arguments["snippet_type"]
-        ctx   = arguments.get("context","")
-        tmpl  = ABAP_TEMPLATES.get(stype, "* Unknown snippet type")
-
-        # RAG: build a semantic query from type + user context
+        stype     = arguments["snippet_type"]
+        ctx       = arguments.get("context", "")
+        tmpl      = ABAP_TEMPLATES.get(stype, "* Unknown snippet type")
         rag_query = f"ABAP {stype} {ctx}".strip()
-        rag_ctx   = build_rag_context(rag_query, n=4)
+        rag_ctx   = await asyncio.to_thread(build_rag_context, rag_query, 4)
 
         out = f"ABAP Template: {stype}\n\n```abap\n{tmpl}\n```"
         if ctx:
@@ -639,12 +669,11 @@ async def call_tool(name: str, arguments: dict):
 
     # ── hana_sql_snippet ───────────────────────────────────────────────────────
     elif name == "hana_sql_snippet":
-        stype = arguments["snippet_type"]
-        ctx   = arguments.get("context","")
-        tmpl  = HANA_TEMPLATES.get(stype, "-- Unknown snippet type")
-
+        stype     = arguments["snippet_type"]
+        ctx       = arguments.get("context", "")
+        tmpl      = HANA_TEMPLATES.get(stype, "-- Unknown snippet type")
         rag_query = f"SAP HANA SQL {stype} {ctx}".strip()
-        rag_ctx   = build_rag_context(rag_query, n=4)
+        rag_ctx   = await asyncio.to_thread(build_rag_context, rag_query, 4)
 
         out = f"SAP HANA SQL Template: {stype}\n\n```sql\n{tmpl}\n```"
         if ctx:
@@ -669,7 +698,7 @@ async def call_tool(name: str, arguments: dict):
             rag_query = "SAP HANA SQL best practices performance " + " ".join(
                 re.findall(r'\b[A-Z_]{3,}\b', code)[:8])
 
-        rag_ctx = build_rag_context(rag_query, n=3)
+        rag_ctx = await asyncio.to_thread(build_rag_context, rag_query, 3)
 
         parts = [f"Code Review ({lang.upper()})\n"]
         if issues:
@@ -684,6 +713,9 @@ async def call_tool(name: str, arguments: dict):
 
 
 async def main():
+    # Pre-warm: load the embedding model and open the Qdrant store before
+    # accepting any MCP requests so the first tool call has no cold-start delay.
+    await asyncio.to_thread(_get_client)
     async with stdio_server() as (r, w):
         await app.run(r, w, app.create_initialization_options())
 

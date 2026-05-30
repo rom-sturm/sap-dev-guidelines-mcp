@@ -8,8 +8,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 
-# ChromaDB vector store (wird lokal neu aufgebaut)
-chroma_store/
+# Qdrant embedded vector store (rebuilt locally on first run)
+qdrant_store/
 
 # Dokument-Cache-Dateien (plain-text Extrakte)
 documents/*.cache.txt
